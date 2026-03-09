@@ -44,7 +44,7 @@ if not hasattr(subprocess, "run"):
     subprocess.run = _subprocess_run
     subprocess.CompletedProcess = _CompletedProcess
 
-AGENT_VERSION = "2.17.5"
+AGENT_VERSION = "2.18.0"
 BORG_PATH = None  # Resolved in get_system_info()
 IS_WINDOWS = sys.platform == "win32"
 
@@ -1105,6 +1105,7 @@ def log_to_server(config, job_id, message, level="info"):
 PLUGIN_DISPLAY_NAMES = {
     "mysql_dump": "MySQL Dump",
     "pg_dump": "PostgreSQL Dump",
+    "mongo_dump": "MongoDB Dump",
 }
 
 
@@ -1154,6 +1155,13 @@ def _plugin_summary(slug, config, result):
         total_size = sum(os.path.getsize(f) for f in dump_files if os.path.exists(f))
         size_str = _format_size(total_size)
         return "PostgreSQL dump: {} database(s) ({}) dumped to {} ({})".format(len(dump_files), ', '.join(db_names), dump_dir, size_str)
+    if slug == "mongo_dump":
+        dump_files = result.get("dump_files", [])
+        dump_dir = result.get("dump_dir", "")
+        db_names = result.get("databases", [os.path.basename(f).split(".")[0] for f in dump_files])
+        total_size = sum(os.path.getsize(f) for f in dump_files if os.path.exists(f))
+        size_str = _format_size(total_size)
+        return "MongoDB dump: {} database(s) ({}) dumped to {} ({})".format(len(dump_files), ', '.join(db_names), dump_dir, size_str)
     if slug == "shell_hook":
         parts = []
         pre = result.get("pre_script", "")
@@ -1499,6 +1507,117 @@ def test_plugin_pg_dump(config):
         parts = line.split("|")
         if parts and parts[0].strip():
             dbs.append(parts[0].strip())
+    return "Connection successful. Found {} database(s): {}".format(len(dbs), ', '.join(dbs[:10]))
+
+
+def execute_plugin_mongo_dump(config):
+    """Dump MongoDB databases before backup using mongodump."""
+    dump_dir = config.get("dump_dir", "/home/bbs/mongodump")
+    os.makedirs(dump_dir, exist_ok=True)
+
+    host = config.get("host", "localhost")
+    port = str(config.get("port", 27017))
+    user = config.get("user", "")
+    password = config.get("password", "")
+    auth_db = config.get("auth_db", "admin")
+    databases = config.get("databases", "*")
+    compress = config.get("compress", True)
+    exclude = config.get("exclude_databases", ["admin", "local", "config"])
+
+    # Build auth args for mongodump / mongosh
+    auth_args = []
+    if user:
+        auth_args.extend(["--username", user, "--authenticationDatabase", auth_db])
+    if password:
+        auth_args.extend(["--password", password])
+
+    if isinstance(databases, str) and databases.strip() == "*":
+        # List all databases via mongosh
+        list_cmd = [
+            "mongosh", "--host", host, "--port", port, "--quiet",
+            "--eval", "db.adminCommand({listDatabases:1}).databases.map(d=>d.name).forEach(print)",
+        ] + auth_args
+        result = subprocess.run(list_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+        if result.returncode != 0:
+            raise Exception("Failed to list databases: {}".format(result.stderr.decode('utf-8', errors='replace').strip()))
+        if isinstance(exclude, str):
+            exclude = [x.strip() for x in exclude.split(",")]
+        databases = [
+            db.strip() for db in result.stdout.decode("utf-8", errors="replace").strip().split("\n")
+            if db.strip() and db.strip() not in exclude
+        ]
+    elif isinstance(databases, str):
+        databases = [d.strip() for d in databases.split(",") if d.strip()]
+
+    dump_files = []
+
+    for db in databases:
+        ext = ".archive.gz" if compress else ".archive"
+        filename = "{}{}".format(db, ext)
+        dump_path = os.path.join(dump_dir, filename)
+        logger.info("Dumping MongoDB database {} to {}".format(db, dump_path))
+
+        cmd = ["mongodump", "--host", host, "--port", port] + auth_args + [
+            "--db", db,
+            "--archive={}".format(dump_path),
+        ]
+        if compress:
+            cmd.append("--gzip")
+
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if r.returncode != 0:
+            raise Exception("mongodump failed for {}: {}".format(db, r.stderr.decode('utf-8', errors='replace')))
+
+        dump_files.append(dump_path)
+
+    logger.info("MongoDB dump complete: {} file(s) in {}".format(len(dump_files), dump_dir))
+    db_names = [os.path.basename(f).split(".")[0] for f in dump_files]
+    return {
+        "dump_files": dump_files,
+        "dump_dir": dump_dir,
+        "databases": db_names,
+        "per_database": True,
+        "compress": compress,
+    }
+
+
+def cleanup_plugin_mongo_dump(config, plugin_result):
+    """Delete MongoDB dump files after backup if cleanup_after is enabled."""
+    if not config.get("cleanup_after", True):
+        return
+    dump_dir = plugin_result.get("dump_dir")
+    if not dump_dir or not os.path.exists(dump_dir):
+        return
+    logger.info("Cleaning up MongoDB dumps in {}".format(dump_dir))
+    for f in os.listdir(dump_dir):
+        fpath = os.path.join(dump_dir, f)
+        if os.path.isfile(fpath) and (f.endswith(".archive") or f.endswith(".archive.gz")):
+            os.remove(fpath)
+
+
+def test_plugin_mongo_dump(config):
+    """Test MongoDB connectivity without dumping."""
+    host = config.get("host", "localhost")
+    port = str(config.get("port", 27017))
+    user = config.get("user", "")
+    password = config.get("password", "")
+    auth_db = config.get("auth_db", "admin")
+
+    auth_args = []
+    if user:
+        auth_args.extend(["--username", user, "--authenticationDatabase", auth_db])
+    if password:
+        auth_args.extend(["--password", password])
+
+    cmd = [
+        "mongosh", "--host", host, "--port", port, "--quiet",
+        "--eval", "db.adminCommand({listDatabases:1}).databases.map(d=>d.name).forEach(print)",
+    ] + auth_args
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
+    if result.returncode != 0:
+        raise Exception("Connection failed: {}".format(result.stderr.decode('utf-8', errors='replace').strip()))
+
+    dbs = [line.strip() for line in result.stdout.decode("utf-8", errors="replace").strip().split("\n") if line.strip()]
     return "Connection successful. Found {} database(s): {}".format(len(dbs), ', '.join(dbs[:10]))
 
 
@@ -2399,6 +2518,15 @@ def execute_task(config, task):
             "databases": pg_result.get("databases", []),
             "per_database": True,
             "compress": pg_result.get("compress", True),
+        }
+
+    # Report backed-up databases from mongo_dump plugin
+    if result == "completed" and task_type == "backup" and plugin_results.get("mongo_dump"):
+        mongo_result = plugin_results["mongo_dump"]
+        status_data["databases_backed_up"] = {
+            "databases": mongo_result.get("databases", []),
+            "per_database": True,
+            "compress": mongo_result.get("compress", True),
         }
 
     # Report final status to server. For completed backups with catalog,

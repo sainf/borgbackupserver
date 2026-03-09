@@ -420,6 +420,66 @@ class PluginManager
                     'default' => '--single-transaction --quick --routines --triggers --events',
                 ],
             ],
+            'mongo_dump' => [
+                'host' => [
+                    'type' => 'text',
+                    'label' => 'MongoDB Host',
+                    'default' => 'localhost',
+                ],
+                'port' => [
+                    'type' => 'number',
+                    'label' => 'Port',
+                    'default' => 27017,
+                ],
+                'user' => [
+                    'type' => 'text',
+                    'label' => 'Username',
+                    'default' => 'bbs_backup',
+                    'help' => 'Leave empty if authentication is not enabled.',
+                ],
+                'password' => [
+                    'type' => 'text',
+                    'label' => 'Password',
+                    'generate' => true,
+                    'sensitive' => true,
+                    'help' => 'Leave empty if authentication is not enabled.',
+                ],
+                'auth_db' => [
+                    'type' => 'text',
+                    'label' => 'Authentication Database',
+                    'default' => 'admin',
+                    'help' => 'The database used to authenticate the user (usually "admin").',
+                ],
+                'databases' => [
+                    'type' => 'text',
+                    'label' => 'Databases',
+                    'default' => '*',
+                    'help' => 'Use * for all databases, or a comma-separated list of specific names.',
+                ],
+                'dump_dir' => [
+                    'type' => 'text',
+                    'label' => 'Dump Directory',
+                    'default' => '/home/bbs/mongodump',
+                    'required' => true,
+                    'help' => 'Local directory where dumps are saved. Automatically included in backup directories.',
+                ],
+                'compress' => [
+                    'type' => 'checkbox',
+                    'label' => 'Compress dumps (gzip)',
+                    'default' => true,
+                ],
+                'cleanup_after' => [
+                    'type' => 'checkbox',
+                    'label' => 'Delete dumps after backup completes',
+                    'default' => true,
+                ],
+                'exclude_databases' => [
+                    'type' => 'tags',
+                    'label' => 'Exclude Databases',
+                    'default' => ['admin', 'local', 'config'],
+                    'help' => 'Comma-separated list of databases to skip when using * above.',
+                ],
+            ],
             'pg_dump' => [
                 'host' => [
                     'type' => 'text',
@@ -581,6 +641,17 @@ class PluginManager
                 . "(AWS S3, Backblaze B2, Wasabi, MinIO, etc.) after prune completes.\n\n"
                 . "Configure global S3 credentials in Settings → Offsite Storage,\n"
                 . "or use custom credentials per configuration.",
+            'mongo_dump' => "// Connect to MongoDB as admin and create a backup user:\n"
+                . "use admin\n"
+                . "db.createUser({\n"
+                . "  user: 'bbs_backup',\n"
+                . "  pwd: 'strong_password',\n"
+                . "  roles: [{ role: 'backup', db: 'admin' }]\n"
+                . "})\n\n"
+                . "Requirements:\n"
+                . "  apt install mongodb-database-tools  # provides mongodump\n"
+                . "  apt install mongosh                 # for connection testing\n\n"
+                . "The built-in 'backup' role grants the minimum privileges needed for mongodump.",
             'pg_dump' => "-- Backup only (read-only):\n"
                 . "CREATE ROLE backup_user WITH LOGIN PASSWORD 'strong_password';\n"
                 . "GRANT CONNECT ON DATABASE mydb TO backup_user;\n"
