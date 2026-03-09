@@ -1532,20 +1532,30 @@ def execute_plugin_mongo_dump(config):
         auth_args.extend(["--password", password])
 
     if isinstance(databases, str) and databases.strip() == "*":
-        # List all databases via mongosh
+        # List all databases via mongosh; use JSON output to avoid line-format
+        # ambiguity when mongosh emits extra text (banners, return values, etc.)
         list_cmd = [
-            "mongosh", "--host", host, "--port", port, "--quiet",
-            "--eval", "db.adminCommand({listDatabases:1}).databases.map(d=>d.name).forEach(print)",
+            "mongosh", "--host", host, "--port", port, "--quiet", "--no-rc",
+            "--eval", "print(JSON.stringify(db.adminCommand({listDatabases:1}).databases.map(function(d){return d.name;})))",
         ] + auth_args
         result = subprocess.run(list_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
         if result.returncode != 0:
             raise Exception("Failed to list databases: {}".format(result.stderr.decode('utf-8', errors='replace').strip()))
         if isinstance(exclude, str):
             exclude = [x.strip() for x in exclude.split(",")]
-        databases = [
-            db.strip() for db in result.stdout.decode("utf-8", errors="replace").strip().split("\n")
-            if db.strip() and db.strip() not in exclude
-        ]
+        db_list = None
+        for line in result.stdout.decode("utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if line.startswith("["):
+                try:
+                    db_list = json.loads(line)
+                    break
+                except Exception:
+                    pass
+        if db_list is None:
+            raise Exception("Failed to parse database list from mongosh output: {}".format(
+                result.stdout.decode("utf-8", errors="replace").strip()))
+        databases = [db for db in db_list if db not in exclude]
     elif isinstance(databases, str):
         databases = [d.strip() for d in databases.split(",") if d.strip()]
 
@@ -1610,14 +1620,22 @@ def test_plugin_mongo_dump(config):
         auth_args.extend(["--password", password])
 
     cmd = [
-        "mongosh", "--host", host, "--port", port, "--quiet",
-        "--eval", "db.adminCommand({listDatabases:1}).databases.map(d=>d.name).forEach(print)",
+        "mongosh", "--host", host, "--port", port, "--quiet", "--no-rc",
+        "--eval", "print(JSON.stringify(db.adminCommand({listDatabases:1}).databases.map(function(d){return d.name;})))",
     ] + auth_args
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
     if result.returncode != 0:
         raise Exception("Connection failed: {}".format(result.stderr.decode('utf-8', errors='replace').strip()))
 
-    dbs = [line.strip() for line in result.stdout.decode("utf-8", errors="replace").strip().split("\n") if line.strip()]
+    dbs = []
+    for line in result.stdout.decode("utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if line.startswith("["):
+            try:
+                dbs = json.loads(line)
+                break
+            except Exception:
+                pass
     return "Connection successful. Found {} database(s): {}".format(len(dbs), ', '.join(dbs[:10]))
 
 
